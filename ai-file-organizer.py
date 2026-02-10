@@ -41,7 +41,7 @@ from collections import defaultdict
 class Config:
     """Production configuration."""
 
-    model: str = "gemini-2.0-flash-exp"
+    model: str = "gemini-2.5-flash"
     ollama_model: str = "llama3.2-vision"
     max_tags_context: int = 100
     confirm_renames: bool = True
@@ -614,7 +614,7 @@ class TMSUManager:
             if result.returncode == 0:
                 print("✓ TMSU repaired")
             else:
-                print(f"⚠ TMSU repair: {result.stderr[:100]}", file=sys.stderr)
+                print("  [WARNING] TMSU database repair encountered an upstream internal error. This is a known bug in TMSU v0.8.0 on Windows and can be safely ignored.", file=sys.stderr)
         except Exception as e:
             print(f"✗ TMSU repair failed: {e}", file=sys.stderr)
         finally:
@@ -725,6 +725,7 @@ class AIAnalyzer:
         ".bmp": "image/bmp",
         ".pdf": "application/pdf",
         ".txt": "text/plain",
+        ".md": "text/plain",
         ".mp3": "audio/mpeg",
         ".wav": "audio/wav",
         ".flac": "audio/flac",
@@ -795,7 +796,7 @@ class AIAnalyzer:
                     },
                 },
                 "description": {"type": "string"},
-                "confidence": {"type": "number", "minimum": 0, "maximum": 1},
+                "confidence": {"type": "number"},
             },
             "required": ["suggested_filename", "tags", "tmsu_values", "confidence"],
         }
@@ -864,53 +865,59 @@ RULES:
         if self.local_mode:
             return self._analyze_ollama(file_path, prompt)
         else:
-            return self._analyze_gemini(file_path, prompt)
+            return self._analyze_gemini(file_path, prompt, text_only=text_content is not None)
 
-    def _analyze_gemini(self, file_path: Path, prompt: str) -> Dict[str, Any]:
+    def _analyze_gemini(self, file_path: Path, prompt: str, text_only: bool = False) -> Dict[str, Any]:
         """
         Analyze with Gemini, with CRITICAL resource cleanup.
         Prevents cloud storage exhaustion.
+        For text files, content is already in the prompt; skip the upload.
         """
         uploaded_file = None
         try:
-            import google.generativeai as genai
+            from google import genai
+            from google.genai import types
 
-            genai.configure(api_key=os.getenv("GEMINI_API_KEY"))
+            client = genai.Client()
 
             file_hash = calculate_smart_hash(file_path)
 
-            # Check recent uploads cache
-            with self._upload_lock:
-                if file_hash in self._recent_uploads:
-                    uploaded_file = self._recent_uploads[file_hash]
-
-            if not uploaded_file:
-                mime_type = self._get_mime_type(file_path)
-                print(f"  📤 Uploading...")
-
-                uploaded_file = genai.upload_file(
-                    path=str(file_path), mime_type=mime_type
-                )
-
-                # Wait for processing
-                while uploaded_file.state.name == "PROCESSING":
-                    time.sleep(0.5)
-                    uploaded_file = genai.get_file(uploaded_file.name)
-
-                if uploaded_file.state.name == "FAILED":
-                    raise Exception("Upload failed")
-
+            # Text files: content already embedded in prompt, skip upload
+            if not text_only:
+                # Check recent uploads cache
                 with self._upload_lock:
-                    self._recent_uploads[file_hash] = uploaded_file
+                    if file_hash in self._recent_uploads:
+                        uploaded_file = self._recent_uploads[file_hash]
 
-            model = genai.GenerativeModel(self.model)
-            response = model.generate_content(
-                [prompt, uploaded_file],
-                generation_config={
-                    "temperature": 0.2,
-                    "response_mime_type": "application/json",
-                    "response_schema": self._prepare_schema(),
-                },
+                if not uploaded_file:
+                    mime_type = self._get_mime_type(file_path)
+                    print(f"  📤 Uploading...")
+
+                    uploaded_file = client.files.upload(
+                        file=str(file_path), config={"mime_type": mime_type}
+                    )
+
+                    # Wait for processing
+                    while uploaded_file.state.name == "PROCESSING":
+                        time.sleep(0.5)
+                        uploaded_file = client.files.get(name=uploaded_file.name)
+
+                    if uploaded_file.state.name == "FAILED":
+                        raise Exception("Upload failed")
+
+                    with self._upload_lock:
+                        self._recent_uploads[file_hash] = uploaded_file
+
+            contents = [prompt, uploaded_file] if uploaded_file else [prompt]
+
+            response = client.models.generate_content(
+                model=self.model,
+                contents=contents,
+                config=types.GenerateContentConfig(
+                    temperature=0.2,
+                    response_mime_type="application/json",
+                    response_schema=self._prepare_schema(),
+                ),
             )
 
             result = json.loads(response.text)
@@ -918,7 +925,7 @@ RULES:
             # CRITICAL: Clean up cloud resource immediately
             if uploaded_file:
                 try:
-                    uploaded_file.delete()
+                    client.files.delete(name=uploaded_file.name)
                     with self._upload_lock:
                         if file_hash in self._recent_uploads:
                             del self._recent_uploads[file_hash]
@@ -931,7 +938,7 @@ RULES:
             # Cleanup on failure
             if uploaded_file:
                 try:
-                    uploaded_file.delete()
+                    client.files.delete(name=uploaded_file.name)
                 except:
                     pass
             print(f"  ✗ Gemini error: {e}", file=sys.stderr)
@@ -998,6 +1005,9 @@ def safe_rename(
     file_path: Path, new_name: str, dry_run: bool = False
 ) -> Tuple[Path, bool]:
     new_name = sanitize_filename(new_name)
+    orig_ext = file_path.suffix.lower()
+    if orig_ext and not new_name.lower().endswith(orig_ext):
+        new_name = new_name + orig_ext
     new_path = file_path.parent / new_name
 
     if new_path.exists() and new_path != file_path:
@@ -1105,6 +1115,10 @@ def process_file(
     # Display
     print(f"  Confidence: {analysis.get('confidence', 0):.0%}")
     print(f"  → {analysis.get('suggested_filename', 'N/A')}")
+    print(f"  Tags:       {', '.join(analysis.get('tags', []))}")
+    print(f"  Values:     {json.dumps(analysis.get('tmsu_values', {}))}")
+    if analysis.get('description'):
+        print(f"  Desc:       {analysis['description']}")
 
     # Interactive
     if args.interactive:
@@ -1219,6 +1233,10 @@ def main():
 
     # Check deps
     env = check_environment()
+    if not env["tmsu"]:
+        print("[WARNING] 'tmsu' not found in PATH. Tagging features will be disabled.", file=sys.stderr)
+    if not env["exiftool"]:
+        print("[WARNING] 'exiftool' not found in PATH. Advanced metadata extraction and XMP embedding will be disabled.", file=sys.stderr)
     if args.local and not env["ollama"]:
         print("Error: Ollama not found", file=sys.stderr)
         sys.exit(1)
