@@ -25,6 +25,7 @@ import shutil
 import sqlite3
 import subprocess
 import sys
+import tempfile
 import time
 import threading
 from pathlib import Path
@@ -891,11 +892,26 @@ RULES:
 
                 if not uploaded_file:
                     mime_type = self._get_mime_type(file_path)
+                    safe_name = sanitize_filename(file_path.name)
                     print(f"  📤 Uploading...")
 
-                    uploaded_file = client.files.upload(
-                        file=str(file_path), config={"mime_type": mime_type}
-                    )
+                    # Copy to ASCII-safe temp file to avoid UnicodeEncodeError
+                    # in the SDK's multipart Content-Disposition header
+                    with tempfile.NamedTemporaryFile(
+                        delete=False, suffix=file_path.suffix, prefix="ai_upload_"
+                    ) as tmp:
+                        temp_path = tmp.name
+                    try:
+                        shutil.copy2(file_path, temp_path)
+                        uploaded_file = client.files.upload(
+                            file=temp_path,
+                            config={"mime_type": mime_type, "display_name": safe_name},
+                        )
+                    finally:
+                        try:
+                            os.remove(temp_path)
+                        except OSError:
+                            pass
 
                     # Wait for processing
                     while uploaded_file.state.name == "PROCESSING":
