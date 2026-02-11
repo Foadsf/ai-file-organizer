@@ -730,9 +730,12 @@ class AIAnalyzer:
         ".mp3": "audio/mpeg",
         ".wav": "audio/wav",
         ".flac": "audio/flac",
+        ".m4a": "audio/m4a",
+        ".ogg": "audio/ogg",
         ".mp4": "video/mp4",
         ".mov": "video/quicktime",
         ".avi": "video/x-msvideo",
+        ".webm": "audio/webm",
     }
 
     def __init__(
@@ -1278,6 +1281,11 @@ def main():
             ".png",
             ".gif",
             ".mp3",
+            ".m4a",
+            ".wav",
+            ".flac",
+            ".ogg",
+            ".webm",
             ".mp4",
             ".txt",
             ".doc",
